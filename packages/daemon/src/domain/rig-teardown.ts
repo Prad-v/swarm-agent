@@ -134,8 +134,7 @@ export class RigTeardownOrchestrator {
       if (!absent && this.deps.tmuxAdapter.probeSession) {
         try {
           const probe = await this.deps.tmuxAdapter.probeSession(session.sessionName);
-          absent = probe.state === "absent" ||
-            (probe.state === "transport_unavailable" && probe.cause?.includes("no server running") === true);
+          absent = probe.state === "absent";
           if (probe.state !== "present" && !absent) {
             result.errors.push(`Could not confirm session '${session.sessionName}' is absent: ${probe.state === "transport_unavailable" ? probe.cause : probe.state}`);
             killFailures++;
@@ -150,7 +149,9 @@ export class RigTeardownOrchestrator {
       const killResult = absent ? { ok: false, code: "session_not_found" } :
         await this.deps.tmuxAdapter.killSession(session.sessionName);
 
-      if (killResult.ok || (killResult as { code?: string }).code === "session_not_found") {
+      const missingSession = (killResult as { code?: string; message?: string }).code === "session_not_found" &&
+        !/no server running/i.test((killResult as { message?: string }).message ?? "");
+      if (killResult.ok || missingSession) {
         // Success or already gone — update DB atomically
         this.atomicNodeCleanup(session);
         this.cleanupManagedGuidanceFileForNode(rigId, session.runtime, session.cwd, liveGuidanceTargets);
@@ -266,8 +267,18 @@ export class RigTeardownOrchestrator {
   }
 
   private guidancePathKey(path: string): string {
-    const normalized = nodePath.resolve(path);
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    const resolved = nodePath.resolve(path);
+    try {
+      const real = fs.realpathSync.native(resolved);
+      const stat = fs.statSync(real);
+      // File identity covers symlinks, hard links, and case aliases on a
+      // case-insensitive volume without assuming all volumes behave alike.
+      if (stat.ino !== 0) return `file:${stat.dev}:${stat.ino}`;
+      return `path:${process.platform === "win32" ? real.toLowerCase() : real}`;
+    } catch {
+      // Cleanup is a no-op for a missing file; keep a stable path key for it.
+      return `path:${process.platform === "win32" ? resolved.toLowerCase() : resolved}`;
+    }
   }
 
   private cleanupManagedGuidanceFileForNode(rigId: string, runtime: string | null, cwd: string | null, liveGuidanceTargets: ReadonlySet<string>): void {
